@@ -105,6 +105,47 @@ namespace PowerPlanTray
         [DllImport("user32.dll")]
         internal static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
+        // winexe 没有控制台，命令行模式下要把文字写回父进程的终端
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AttachConsole(int pid);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreateFileW(string name, uint access, uint share,
+            IntPtr security, uint disposition, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool WriteConsoleW(IntPtr handle, string text, int length,
+            out int written, IntPtr reserved);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        private static IntPtr consoleOut;
+        private static bool consoleTried;
+
+        // 只有父进程带控制台时才输出；重定向到文件/管道拿不到，故另有 --list <文件>
+        internal static bool TryConsole()
+        {
+            if (consoleTried) return consoleOut != IntPtr.Zero && consoleOut != new IntPtr(-1);
+            consoleTried = true;
+            if (!AttachConsole(-1)) return false;
+            consoleOut = CreateFileW("CONOUT$", 0xC0000000u, 3u, IntPtr.Zero, 3u, 0u, IntPtr.Zero);
+            return consoleOut != IntPtr.Zero && consoleOut != new IntPtr(-1);
+        }
+
+        internal static void WriteLine(string text)
+        {
+            if (!TryConsole()) return;
+            string line = text + "\r\n";
+            int written;
+            WriteConsoleW(consoleOut, line, line.Length, out written, IntPtr.Zero);
+        }
+
+        internal static void WriteLines(string[] lines)
+        {
+            foreach (string line in lines) WriteLine(line);
+        }
+
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern IntPtr CreatePopupMenu();
 
@@ -135,6 +176,7 @@ namespace PowerPlanTray
     {
         public Guid Guid;
         public string Name;        // 本地化名称
+        public string Label;       // 菜单显示名：重名时追加序号
         public string EnglishName; // 用于排序/配色
         public int Rank;
         public int Level;          // 图标电量
@@ -226,7 +268,36 @@ namespace PowerPlanTray
                 int c = a.Rank.CompareTo(b.Rank);
                 return c != 0 ? c : string.Compare(a.Name, b.Name, StringComparison.CurrentCulture);
             });
+            Disambiguate(list);
             return list;
+        }
+
+        // 同一台机器上可能装着同名计划（第三方工具导入的副本），菜单里必须能区分
+        internal static void Disambiguate(List<PlanInfo> plans)
+        {
+            Dictionary<string, int> totals = new Dictionary<string, int>(StringComparer.CurrentCultureIgnoreCase);
+            foreach (PlanInfo p in plans)
+            {
+                int n;
+                totals.TryGetValue(p.Name, out n);
+                totals[p.Name] = n + 1;
+            }
+            Dictionary<string, int> seen = new Dictionary<string, int>(StringComparer.CurrentCultureIgnoreCase);
+            foreach (PlanInfo p in plans)
+            {
+                int total;
+                totals.TryGetValue(p.Name, out total);
+                if (total <= 1)
+                {
+                    p.Label = p.Name;
+                    continue;
+                }
+                int index;
+                seen.TryGetValue(p.Name, out index);
+                index++;
+                seen[p.Name] = index;
+                p.Label = p.Name + " (" + index + ")";
+            }
         }
 
         private static string EnglishOf(string raw)
@@ -277,6 +348,7 @@ namespace PowerPlanTray
         private const int CmdStartup = 2002;
         private const int CmdRefresh = 2003;
         private const int CmdExit = 2004;
+        private const int MaxPlans = CmdPowerCpl - CmdPlanBase;
 
         private readonly NotifyIcon notify;
         private readonly Form host;
@@ -330,11 +402,11 @@ namespace PowerPlanTray
                 {
                     Native.AppendMenu(h, Native.MF_STRING | Native.MF_GRAYED, UIntPtr.Zero, "未能读取电源计划");
                 }
-                for (int i = 0; i < plans.Count; i++)
+                for (int i = 0; i < plans.Count && i < MaxPlans; i++)
                 {
                     uint flags = Native.MF_STRING;
                     if (plans[i].Guid == active) flags |= Native.MF_CHECKED;
-                    Native.AppendMenu(h, flags, (UIntPtr)(CmdPlanBase + i), plans[i].Name);
+                    Native.AppendMenu(h, flags, (UIntPtr)(CmdPlanBase + i), plans[i].Label);
                 }
 
                 Native.AppendMenu(h, Native.MF_SEPARATOR, UIntPtr.Zero, null);
@@ -365,7 +437,7 @@ namespace PowerPlanTray
 
         private void Dispatch(int cmd, List<PlanInfo> plans)
         {
-            if (cmd >= CmdPlanBase && cmd < CmdPlanBase + plans.Count)
+            if (cmd >= CmdPlanBase && cmd < CmdPlanBase + Math.Min(plans.Count, MaxPlans))
             {
                 Switch(plans[cmd - CmdPlanBase]);
                 return;
@@ -416,12 +488,12 @@ namespace PowerPlanTray
             if (Plans.SetActive(p.Guid))
             {
                 lastActive = p.Guid;
-                ApplyIcon(p);
-                ShowBalloon("电源计划：" + p.Name, "已切换", ToolTipIcon.None);
+                ApplyIcon(p.Color, p.Level, p.Name);
+                ShowBalloon("电源计划：" + p.Label, "已切换", ToolTipIcon.None);
             }
             else
             {
-                ShowBalloon("切换失败", "系统拒绝了切换请求：" + p.Name, ToolTipIcon.Error);
+                ShowBalloon("切换失败", "系统拒绝了切换请求：" + p.Label, ToolTipIcon.Error);
             }
         }
 
@@ -436,17 +508,24 @@ namespace PowerPlanTray
             List<PlanInfo> plans = Plans.Load();
             PlanInfo p = Plans.Find(plans, active);
             lastActive = active;
-            if (p != null) ApplyIcon(p);
+            if (p != null)
+            {
+                ApplyIcon(p.Color, p.Level, "电源计划：" + p.Name);
+                return;
+            }
+            // 活动方案没出现在注册表清单里（或读取失败）时也必须留一个图标，否则托盘直接空掉
+            ApplyIcon(Color.FromArgb(130, 130, 130), 50,
+                active == Guid.Empty ? "电源计划：未知" : "电源计划：" + active);
         }
 
-        private void ApplyIcon(PlanInfo p)
+        private void ApplyIcon(Color color, int level, string tooltip)
         {
-            Icon ic = MakeIcon(p.Color, p.Level);
+            Icon ic = MakeIcon(color, level);
             Icon old = currentIcon;
             notify.Icon = ic;
             currentIcon = ic;
             if (old != null) old.Dispose();
-            notify.Text = Truncate("电源计划：" + p.Name, 63);
+            notify.Text = Truncate(tooltip, 63);
         }
 
         private void ShowBalloon(string title, string text, ToolTipIcon icon)
@@ -484,16 +563,24 @@ namespace PowerPlanTray
             string lnk = StartupLnk;
             string exe = Application.ExecutablePath;
             Type t = Type.GetTypeFromProgID("WScript.Shell");
-            object shell = Activator.CreateInstance(t);
-            object sc = t.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { lnk });
-            Type sct = sc.GetType();
-            sct.InvokeMember("TargetPath", BindingFlags.SetProperty, null, sc, new object[] { exe });
-            sct.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, sc, new object[] { Path.GetDirectoryName(exe) });
-            sct.InvokeMember("Description", BindingFlags.SetProperty, null, sc, new object[] { "任务栏电源计划快速切换" });
-            sct.InvokeMember("IconLocation", BindingFlags.SetProperty, null, sc, new object[] { exe + ",0" });
-            sct.InvokeMember("Save", BindingFlags.InvokeMethod, null, sc, null);
-            Marshal.ReleaseComObject(sc);
-            Marshal.ReleaseComObject(shell);
+            object shell = null;
+            object sc = null;
+            try
+            {
+                shell = Activator.CreateInstance(t);
+                sc = t.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { lnk });
+                Type sct = sc.GetType();
+                sct.InvokeMember("TargetPath", BindingFlags.SetProperty, null, sc, new object[] { exe });
+                sct.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, sc, new object[] { Path.GetDirectoryName(exe) });
+                sct.InvokeMember("Description", BindingFlags.SetProperty, null, sc, new object[] { "任务栏电源计划快速切换" });
+                sct.InvokeMember("IconLocation", BindingFlags.SetProperty, null, sc, new object[] { exe + ",0" });
+                sct.InvokeMember("Save", BindingFlags.InvokeMethod, null, sc, null);
+            }
+            finally
+            {
+                if (sc != null && Marshal.IsComObject(sc)) Marshal.ReleaseComObject(sc);
+                if (shell != null && Marshal.IsComObject(shell)) Marshal.ReleaseComObject(shell);
+            }
         }
 
         // ---------- 图标绘制 ----------
@@ -615,8 +702,10 @@ namespace PowerPlanTray
                 foreach (byte[] png in pngs) w.Write(png);
                 w.Flush();
                 ico.Position = 0;
-                Icon ic = new Icon(ico);
-                return (Icon)ic.Clone();
+                using (Icon raw = new Icon(ico))
+                {
+                    return (Icon)raw.Clone();
+                }
             }
         }
 
@@ -643,6 +732,14 @@ namespace PowerPlanTray
 
     internal static class Program
     {
+        internal const string Version = "1.1.0";
+
+        internal const int ExitOk = 0;
+        internal const int ExitFailed = 1;
+        internal const int ExitUsage = 2;
+        internal const int ExitUnknownPlan = 3;
+        internal const int ExitAmbiguous = 4;
+
         private static Mutex mutex;
 
         [STAThread]
@@ -651,35 +748,25 @@ namespace PowerPlanTray
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            string first = args.Length > 0 ? args[0].ToLowerInvariant() : "";
-
             try
             {
-                if (first == "--set" || first == "-s")
-                {
-                    if (args.Length < 2) return 2;
-                    Guid g;
-                    if (!Guid.TryParse(args[1], out g))
-                    {
-                        List<PlanInfo> list = Plans.Load();
-                        PlanInfo hit = null;
-                        foreach (PlanInfo p in list)
-                            if (string.Equals(p.Name, args[1], StringComparison.CurrentCultureIgnoreCase) ||
-                                string.Equals(p.EnglishName, args[1], StringComparison.OrdinalIgnoreCase)) { hit = p; break; }
-                        if (hit == null) return 3;
-                        g = hit.Guid;
-                    }
-                    return Plans.SetActive(g) ? 0 : 1;
-                }
+                int code = CommandLine(args);
+                if (code >= 0) return code;
             }
-            catch
+            catch (Exception ex)
             {
-                return 1;
+                Log(ex);
+                Native.WriteLine("出错了：" + ex.Message);
+                return ExitFailed;
             }
 
             bool created;
             mutex = new Mutex(true, "Local\\PowerPlanTray_SingleInstance", out created);
-            if (!created) return 0;
+            if (!created)
+            {
+                Native.WriteLine("PowerPlanTray 已经在运行（托盘里那颗电池图标）。");
+                return ExitOk;
+            }
 
             Application.ThreadException += delegate (object s, ThreadExceptionEventArgs e) { Log(e.Exception); };
             AppDomain.CurrentDomain.UnhandledException += delegate (object s, UnhandledExceptionEventArgs e)
@@ -690,7 +777,219 @@ namespace PowerPlanTray
             TrayApp app = new TrayApp();
             Application.Run();
             app.Dispose();
-            return 0;
+            return ExitOk;
+        }
+
+        // 返回 -1 表示没有命令行动作，应该启动托盘
+        private static int CommandLine(string[] args)
+        {
+            string first = args.Length > 0 ? args[0].ToLowerInvariant() : "";
+            switch (first)
+            {
+                case "":
+                    return -1;
+                case "--help":
+                case "-h":
+                case "-?":
+                    Native.WriteLines(Usage());
+                    return ExitOk;
+                case "--version":
+                case "-v":
+                    Native.WriteLines(new string[]
+                    {
+                        "PowerPlanTray " + Version,
+                        ".NET Framework " + Environment.Version,
+                        Environment.OSVersion.VersionString,
+                    });
+                    return ExitOk;
+                case "--list":
+                case "-l":
+                    return ListPlans(args.Length > 1 ? args[1] : null);
+                case "--set":
+                case "-s":
+                    return SetPlan(args);
+                default:
+                    Native.WriteLine("无法识别的参数：" + args[0]);
+                    Native.WriteLines(Usage());
+                    return ExitUsage;
+            }
+        }
+
+        private static string[] Usage()
+        {
+            return new string[]
+            {
+                "PowerPlanTray " + Version + " - 任务栏电源计划快速切换",
+                "",
+                "用法：",
+                "  PowerPlanTray.exe                       启动托盘程序（无参数）",
+                "  PowerPlanTray.exe --set <计划名|GUID>    切换电源计划",
+                "  PowerPlanTray.exe --list [文件路径]      列出电源计划；.json 存 JSON，.txt 存文本",
+                "  PowerPlanTray.exe --version             显示版本",
+                "  PowerPlanTray.exe --help                显示本帮助",
+                "",
+                "返回码：0 成功 / 1 切换失败 / 2 用法错误 / 3 找不到计划 / 4 计划名重复（请改用 GUID）",
+                "说明：程序是 winexe，这些文字只在从 cmd / PowerShell 启动时打印到终端；",
+                "      需要机器可读结果时用 --list <文件> 或返回码。",
+            };
+        }
+
+        private static int SetPlan(string[] args)
+        {
+            if (args.Length < 2 || string.IsNullOrEmpty(args[1]))
+            {
+                Native.WriteLines(Usage());
+                return ExitUsage;
+            }
+            List<PlanInfo> plans = Plans.Load();
+            Guid g;
+            PlanInfo target;
+            if (Guid.TryParse(args[1], out g))
+            {
+                target = Plans.Find(plans, g);
+            }
+            else
+            {
+                bool ambiguous;
+                target = Match(plans, args[1], out ambiguous);
+                if (ambiguous)
+                {
+                    Native.WriteLine("计划名「" + args[1] + "」对应多个计划，请改用 GUID：");
+                    foreach (PlanInfo p in plans)
+                    {
+                        if (SameName(p, args[1])) Native.WriteLine("  " + p.Guid + "  " + p.Label);
+                    }
+                    return ExitAmbiguous;
+                }
+            }
+            if (target == null)
+            {
+                Native.WriteLine("找不到电源计划：「" + args[1] + "」，可用 --list 查看。");
+                return ExitUnknownPlan;
+            }
+            if (!Plans.SetActive(target.Guid))
+            {
+                Native.WriteLine("系统拒绝了切换请求：" + target.Label);
+                return ExitFailed;
+            }
+            Native.WriteLine("已切换到：" + target.Label);
+            return ExitOk;
+        }
+
+        private static bool SameName(PlanInfo p, string text)
+        {
+            return string.Equals(p.Name, text, StringComparison.CurrentCultureIgnoreCase)
+                || string.Equals(p.Label, text, StringComparison.CurrentCultureIgnoreCase)
+                || string.Equals(p.EnglishName, text, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static PlanInfo Match(List<PlanInfo> plans, string text, out bool ambiguous)
+        {
+            PlanInfo hit = null;
+            int count = 0;
+            foreach (PlanInfo p in plans)
+            {
+                if (!SameName(p, text)) continue;
+                count++;
+                if (hit == null) hit = p;
+            }
+            ambiguous = count > 1;
+            return hit;
+        }
+
+        private static int ListPlans(string output)
+        {
+            List<PlanInfo> plans = Plans.Load();
+            Guid active = Plans.GetActive();
+            PlanInfo current = Plans.Find(plans, active);
+
+            string[] table = Table(plans, active, current);
+            Native.WriteLines(table);
+
+            if (!string.IsNullOrEmpty(output))
+            {
+                try
+                {
+                    string full = Path.GetFullPath(output);
+                    string dir = Path.GetDirectoryName(full);
+                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                    // 控制台写不进去时（被重定向、或从资源管理器启动），落盘是唯一可读的渠道
+                    bool asText = string.Equals(Path.GetExtension(full), ".txt", StringComparison.OrdinalIgnoreCase);
+                    File.WriteAllText(full, asText ? string.Join("\r\n", table) + "\r\n" : ToJson(plans, active),
+                        new UTF8Encoding(false));
+                    Native.WriteLine("");
+                    Native.WriteLine("已写入：" + full);
+                }
+                catch (Exception ex)
+                {
+                    Native.WriteLine("写入文件失败：" + ex.Message);
+                    return ExitFailed;
+                }
+            }
+            return plans.Count > 0 ? ExitOk : ExitFailed;
+        }
+
+        private static string[] Table(List<PlanInfo> plans, Guid active, PlanInfo current)
+        {
+            List<string> lines = new List<string>();
+            lines.Add("PowerPlanTray " + Version);
+            lines.Add(plans.Count == 0
+                ? "未能读取电源计划（注册表访问被拒绝？）"
+                : "共 " + plans.Count + " 个计划，当前：" + (current != null ? current.Label : active.ToString()));
+            lines.Add("");
+            lines.Add("  GUID                                  名称                  英文名");
+            foreach (PlanInfo p in plans)
+            {
+                lines.Add(string.Format("  {0}  {1}{2}  {3}",
+                    p.Guid, p.Guid == active ? "* " : "  ", p.Label, p.EnglishName));
+            }
+            return lines.ToArray();
+        }
+
+        private static string ToJson(List<PlanInfo> plans, Guid active)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("{\n");
+            sb.Append("  \"version\": \"").Append(Escape(Version)).Append("\",\n");
+            sb.Append("  \"active\": \"").Append(active.ToString()).Append("\",\n");
+            sb.Append("  \"plans\": [\n");
+            for (int i = 0; i < plans.Count; i++)
+            {
+                PlanInfo p = plans[i];
+                sb.Append("    {\"guid\": \"").Append(p.Guid.ToString()).Append("\"");
+                sb.Append(", \"name\": \"").Append(Escape(p.Name)).Append("\"");
+                sb.Append(", \"label\": \"").Append(Escape(p.Label)).Append("\"");
+                sb.Append(", \"englishName\": \"").Append(Escape(p.EnglishName)).Append("\"");
+                sb.Append(", \"rank\": ").Append(p.Rank);
+                sb.Append(", \"level\": ").Append(p.Level);
+                sb.Append(", \"active\": ").Append(p.Guid == active ? "true" : "false");
+                sb.Append("}").Append(i + 1 < plans.Count ? "," : "").Append("\n");
+            }
+            sb.Append("  ]\n");
+            sb.Append("}\n");
+            return sb.ToString();
+        }
+
+        private static string Escape(string text)
+        {
+            if (text == null) return "";
+            StringBuilder sb = new StringBuilder(text.Length + 8);
+            foreach (char c in text)
+            {
+                switch (c)
+                {
+                    case '"': sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < ' ') sb.Append("\\u").Append(((int)c).ToString("x4"));
+                        else sb.Append(c);
+                        break;
+                }
+            }
+            return sb.ToString();
         }
 
         private static void Log(Exception ex)

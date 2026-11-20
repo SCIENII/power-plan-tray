@@ -28,8 +28,53 @@ Windows 11 只有在**检测到电池**时才在任务栏托盘显示电源图�
 | 秒切 | 直接调 `powrprof!PowerSetActiveScheme`，不启子进程、不闪黑框 |
 | 开机自启 | 菜单里勾选/取消，写入当前用户「启动」文件夹 |
 | 外部同步 | 在控制面板里改了计划，2 秒内图标自动跟随 |
-| 命令行 | `PowerPlanTray.exe --set 高性能`，方便绑快捷键/计划任务 |
-| 单文件 | `PowerPlanTray.exe` 约 19 KB，纯 .NET Framework 4.x，零第三方依赖 |
+| 重名计划 | 同名计划自动加序号（`高性能 (1)` / `高性能 (2)`），菜单里点得准 |
+| 命令行 | `PowerPlanTray.exe --set 高性能`、`--list` 导出计划清单，方便绑快捷键/计划任务/自动巡检 |
+| 单文件 | `PowerPlanTray.exe` 约 25 KB，纯 .NET Framework 4.x，零第三方依赖 |
+
+## 命令行
+
+程序是 `winexe`，没有自己的控制台（原因见踩坑 #9）。所以命令行模式**以返回码表达结果**，
+需要机器可读数据时用 `--list <文件>` 落盘：
+
+| 命令 | 作用 | 返回码 |
+| --- | --- | --- |
+| `PowerPlanTray.exe` | 启动托盘程序 | — |
+| `--set <计划名\|GUID>` | 切换电源计划 | 0 成功 / 1 切换被拒 / 3 找不到计划 / 4 计划名重复 |
+| `--list [文件]` | 列出计划；`.json` 存 JSON，`.txt` 存文本 | 0 成功 / 1 读不到计划 |
+| `--version` / `-v` | 打印版本、.NET 与系统版本 | 0 |
+| `--help` / `-h` | 打印用法 | 0 |
+
+`--set` 与 `--list` 之外，参数写错一律返回 **2**（用法错误），不会再默默把托盘程序拉起来。
+同一个计划名对应多个计划时返回 **4** 并列出各自的 GUID——猜一个去切才是更糟的行为：
+
+```bat
+PowerPlanTray.exe --set 高性能          :: 本机有两个「高性能」-> 返回 4
+PowerPlanTray.exe --set "高性能 (1)"     :: 用菜单里看到的序号 -> 返回 0
+PowerPlanTray.exe --set b64f70a1-22e0-4842-9d72-09e8594cbb32
+```
+
+`--list` 写出的是 UTF-8 无 BOM，中文计划名原样保留：
+
+```json
+{
+  "version": "1.1.0",
+  "active": "a1841308-3541-4fab-bc81-f71556f20b4a",
+  "plans": [
+    {"guid": "…", "name": "节能", "label": "节能", "englishName": "Power saver", "rank": 1, "level": 22, "active": true}
+  ]
+}
+```
+
+## 测试
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-tests.ps1
+```
+
+26 项断言：编译、`--version`/`--help`/`--list`/`--set` 与全部返回码、重名计划去重、
+单实例、图标生成（含 GDI 句柄不泄漏）。脚本开始时记下当前电源计划，结束时还原。
+`-SkipBuild` 跳过编译，`-SkipIconProbe` 跳过反射图标检查。
 
 菜单项：当前计划列表（打勾的是生效中）、电源选项（控制面板）、Windows 设置 · 电源和电池、开机自动启动、刷新、退出。
 
@@ -42,6 +87,13 @@ Windows 11 只有在**检测到电池**时才在任务栏托盘显示电源图�
 
 > 如果图标被折叠进 `^` 溢出区：Win11 里把它拖到托盘可见区，或 `设置 → 个性化 → 任务栏 → 其他系统托盘图标` 里打开。本仓库的脚本会在首次运行时按 exe 路径自动写入
 > `HKCU\Control Panel\NotifyIconSettings\<hash>\IsPromoted = 1`（见下文踩坑 #5）。
+
+想绑快捷键或计划任务，用命令行（见[下文](#命令行)）：
+
+```bat
+PowerPlanTray.exe --set 节能
+PowerPlanTray.exe --list "%TEMP%\plans.json"
+```
 
 ## 构建
 
@@ -67,6 +119,8 @@ build.cmd
 - **切计划**：`PowerSetActiveScheme(NULL, &guid)`，比 `powercfg /s` 快且无窗口闪烁。
 - **菜单**：`CreatePopupMenu` + `AppendMenuW` + `TrackPopupMenu(TPM_RETURNCMD | TPM_WORKAREA)`，由系统绘制，自动获得 Win11 深色主题、圆角与键盘导航。
 - **图标**：GDI+ 画电池（电量条 = 计划档位，颜色 = 计划类别），以 **PNG 负载写 ICO**，一次给 16/20/24/32 四个尺寸（母版 128px 缩放），保证托盘里不糊。
+- **命令行**：`AttachConsole(-1)` + `WriteConsoleW` 写回父终端（踩坑 #9），`--list` 支持 `.json`/`.txt` 落盘；
+  重名方案在 `Plans.Load()` 里统一加序号，菜单和 `--list` 用的是同一份 `Label`，`--set` 匹配 `Name`/`Label`/`EnglishName` 三者的并集，命中多个就报错而不是挑一个。
 
 ## 踩坑记录
 
@@ -161,14 +215,40 @@ ICONDIR(6B) + ICONDIRENTRY(16B/尺寸) + PNG 数据
 
 原因：GUI 子系统进程不挂控制台，`Console.WriteLine` 无处可去；PowerShell 也不等待 GUI 进程。
 
-解法：命令行模式只用**返回码**表达结果（`0` 成功），或者用 `Start-Process -Wait -PassThru` 读 `ExitCode`。
+解法：**返回码 + 落盘**双通道。
 
-### 10. 其它小坑
+- 交互式场景用 `AttachConsole(-1)` 抢回父进程的控制台，再用 `WriteConsoleW` 写宽字符
+  （不能写 UTF-8 字节：控制台代码页是 936，中文会变乱码）。这样从 cmd/PowerShell 里手敲
+  `--help`、`--list` 能直接看到输出。
+- 脚本/重定向场景拿不到控制台（用 `>` 或管道都抓不到），所以 `--list <文件>` 把结构化结果写进
+  文件，`--set` 只用返回码表达结果。
+- 需要等 GUI 进程结束时用 `Start-Process -Wait -PassThru` 读 `ExitCode`。
+
+### 10. 同一台机器可能装着两个同名电源计划
+
+现象：菜单里出现两条一模一样的「高性能」，点哪条、`--set 高性能` 会切到哪条都说不清。
+
+原因：第三方工具/手动导入会往 `HKLM\...\Power\User\PowerSchemes` 里塞同名的副本，
+它们的 GUID 不同、子键数量不同，但 `FriendlyName` 的 MUI 资源 id 相同，`PowerReadFriendlyName`
+读出来就是同一个字符串。实测本机同时有「高性能」和「卓越性能」各两份（共 6 个可切换计划，
+`powercfg /list` 只显示其中的 4 个），而且 **这些"多余"的方案照样能切换**，不能当无效项过滤掉。
+
+解法：显示名去重（`高性能 (1)` / `高性能 (2)`），`--set` 遇到重名不猜，返回 4 并让用户改用 GUID 或带序号的标签。
+
+### 11. 无 BOM 的 `.ps1` 在 Windows PowerShell 5.1 里会被按 GBK 解析
+
+和踩坑 #8 同源：`csc` 读源码用 ANSI，`powershell.exe 5.1` 读脚本文件也一样。
+带中文注释的脚本会报 `Unexpected token ')'` 这类莫名其妙的位置错误。
+解法：`tests/*.ps1` 全用 ASCII 写；必须写中文时存成 **带 BOM 的 UTF-8**。
+
+### 12. 其它小坑
 
 - `using System.Threading;` + `using System.Windows.Forms;` 时 `Timer` 二义性（`CS0104`），显式写 `System.Windows.Forms.Timer`。
 - 菜单里的"开机自动启动"勾选状态每次打开菜单都要重新读文件系统，否则取消勾选后不会刷新。
 - 切换计划后图标要立刻更新，同时保留 2 秒轮询兜底——否则用户在控制面板改完，托盘图标会一直是旧的。
 - Explorer 崩溃重启后 WinForms `NotifyIcon` 会自己重新注册（`TaskbarCreated` 消息），不用额外处理；但注册表里的 `IsPromoted` 不会丢。
+- 活动方案万一不在 `PowerSchemes` 清单里（读注册表失败、或切到了覆盖层 GUID），也必须给托盘塞一个灰色兜底图标，
+  否则 `NotifyIcon.Icon` 一直是 null，托盘里干脆什么都没有。
 
 ## 已知限制
 

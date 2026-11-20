@@ -4,6 +4,9 @@
 *.ilk
 *.obj
 
+# 测试临时目录（tests\run-tests.ps1）
+build/
+
 # IDE
 .vs/
 .vscode/
